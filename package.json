@@ -30,6 +30,7 @@
   "homepage": "https://github.com/FabricLabs/idlerpg#readme",
   "dependencies": {
     "fast-json-patch": "^2.0.6",
+    "@fabric/core": "FabricLabs/fabric#fabric-core-final",
     "indefinite-article": "0.0.2",
     "json-pointer": "^0.6.0",
     "level": "^3.0.2",
