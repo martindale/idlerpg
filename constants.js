@@ -38,8 +38,9 @@ const LEVEL_EXPONENT = 1.65;
 const PENALTY_COOLDOWN = 10;
 const PENALTY_FACTOR = 0.5;
 
-// Day buckets kept; 0 keeps every day ever recorded.
-const RETENTION_DAYS = 0;
+// Day buckets kept; 0 keeps every day ever recorded. The whole game is one
+// Store key with a size cap, so history is bounded by default.
+const RETENTION_DAYS = 400;
 
 // Days a bucket keeps which players it counted; older ones keep the count only.
 // Reports read player ids from the last 30 days, so fewer are raised to 30.

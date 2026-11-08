@@ -67,6 +67,10 @@ function accountKey (account) {
   return account.service ? `${account.service}/users/${account.id}` : account.id;
 }
 
+function isRecord (value) {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
 function dayKey (ms) {
   return new Date(ms).toISOString().slice(0, 10);
 }
@@ -151,7 +155,7 @@ class IdleRPG extends Service {
    * @param {boolean} [settings.penalties=true] Slash wealth for chatting in the
    *   announcement channels, or in a game channel when there are none.
    * @param {boolean} [settings.autostart=true] Run the tick clock on `start()`.
-   * @param {number} [settings.retentionDays=0] Day buckets kept (0 = keep all history).
+   * @param {number} [settings.retentionDays=400] Day buckets kept (0 = keep all history).
    * @param {number} [settings.playerListDays=30] Days a bucket keeps which players it
    *   counted (at least 30, which reports read); older buckets keep `playerCount`
    *   only, so the save stops growing by a list per day (0 = keep every list).
@@ -203,7 +207,7 @@ class IdleRPG extends Service {
 
     this.worldClock = new WorldClock({ interval: this.settings.tickMs, now: this.settings.now });
     this.worldClock.on('tick', () => {
-      this.tick().catch((error) => this.emit('error', `[IDLERPG] tick: ${error && error.message ? error.message : error}`));
+      this.tick().catch((error) => this._fail(`[IDLERPG] tick: ${error && error.message ? error.message : error}`));
     });
     this._dirty = false;
 
@@ -255,15 +259,21 @@ class IdleRPG extends Service {
     if (!this.store) return;
     // A failed read must not start an empty game: the next save would overwrite the real one.
     let prior = await this.store.get(STORE_KEY);
+    if (prior == null) return;
     if (typeof prior === 'string') {
-      try { prior = JSON.parse(prior); } catch (_) { prior = null; }
+      try { prior = JSON.parse(prior); } catch (error) { throw new Error(`[IDLERPG] the save at ${STORE_KEY} cannot be read: ${error.message}`); }
     }
-    if (!prior || typeof prior !== 'object') return;
+    if (!isRecord(prior)) throw new Error(`[IDLERPG] the save at ${STORE_KEY} is not a game`);
+    for (const field of ['users', 'players', 'channels', 'stats']) {
+      if (prior[field] != null && !isRecord(prior[field])) throw new Error(`[IDLERPG] the save at ${STORE_KEY} has a broken ${field}`);
+    }
     const content = this.content;
     content.users = prior.users || {};
     content.players = prior.players || {};
     content.channels = prior.channels || {};
-    content.stats = Object.assign(content.stats, prior.stats || {});
+    for (const [key, value] of Object.entries(prior.stats || {})) {
+      if (key !== '__proto__') content.stats[key] = value;
+    }
     if (!content.stats.days) content.stats.days = {};
     if (!content.stats.battles) content.stats.battles = { won: 0, lost: 0 };
     if (!content.stats.slain) content.stats.slain = {};
@@ -288,9 +298,19 @@ class IdleRPG extends Service {
       return true;
     } catch (error) {
       this._dirty = true;
-      this.emit('error', `[IDLERPG] persist: ${error && error.message ? error.message : error}`);
+      this._fail(`[IDLERPG] persist: ${error && error.message ? error.message : error}`);
       return false;
     }
+  }
+
+  /**
+   * Report a failure. With no `error` listener an emit would throw, crashing
+   * the host or skipping a rollback, so it goes to `debug` instead.
+   * @param {string} message
+   */
+  _fail (message) {
+    if (this.listenerCount('error')) this.emit('error', message);
+    else this.emit('debug', message);
   }
 
   /**
@@ -414,7 +434,7 @@ class IdleRPG extends Service {
       bucket.presentMs += this.settings.tickMs;
       bucket.players[player.id] = 1;
       stats.totalPresentMs += this.settings.tickMs;
-      if (outcome.leveled) this.announce(`${this._publicName(record)} has reached level ${outcome.level}!`);
+      if (outcome.leveled) this.announce(`${this._chatName(record)} has reached level ${outcome.level}!`);
       this._rollForEncounter(record, user);
       Object.assign(player, record.toObject());
     }
@@ -439,7 +459,7 @@ class IdleRPG extends Service {
 
   _pruneDays (now) {
     const days = this.content.stats.days;
-    const retentionDays = Number(this.settings.retentionDays);
+    const retentionDays = this.settings.retentionDays == null ? RETENTION_DAYS : Number(this.settings.retentionDays);
     if (retentionDays > 0) {
       const oldest = dayKey(now - (retentionDays - 1) * DAY_MS);
       for (const key of Object.keys(days)) {
@@ -497,7 +517,7 @@ class IdleRPG extends Service {
   }
 
   _applyEncounter (player, outcome) {
-    const name = this._publicName(player);
+    const name = this._chatName(player);
     const near = outcome.place ? ` near ${outcome.place.name}` : '';
     const stats = this.content.stats;
     const result = player.resolve(outcome);
@@ -725,6 +745,16 @@ class IdleRPG extends Service {
   }
 
   /**
+   * Name safe to post in a channel: a nickname like `@everyone` or `<@&id>`
+   * must not ping anyone.
+   * @param {Object} player
+   * @returns {string}
+   */
+  _chatName (player) {
+    return this._publicName(player).replace(/@/g, '@\u200b').replace(/</g, '<\u200b');
+  }
+
+  /**
    * @param {Object} join `{ user, channel }`
    */
   async _handleJoin (join) {
@@ -748,19 +778,27 @@ class IdleRPG extends Service {
    */
   async _handlePresence (presence) {
     if (!presence || !presence.user) return null;
-    const user = this._user(presence.user);
     const channel = presence.channel || null;
     const sources = this._sources();
+    const known = Object.prototype.hasOwnProperty.call(this.content.users, presence.user) ? this.content.users[presence.user] : null;
+    // Only presence the game counts makes a record; everyone else the host sees is not kept.
+    if (presence.status === 'online') {
+      const counted = channel
+        ? sources.has('channel') && this._channelAllowed(channel)
+        : sources.has('status') && this._channelAllowed(null);
+      if (!counted) return known;
+    } else if (!known) {
+      return null;
+    }
+    const user = this._user(presence.user);
     const wasPresent = this._isPresent(user);
 
     if (presence.status === 'online') {
       if (channel) {
-        if (!sources.has('channel') || !this._channelAllowed(channel)) return user;
         this._channel({ id: channel });
         this.content.channels[channel].members[user.id] = 1;
         user.channels[channel] = 1;
       } else {
-        if (!sources.has('status') || !this._channelAllowed(null)) return user;
         user.status = 'online';
       }
     } else if (channel) {
@@ -801,7 +839,7 @@ class IdleRPG extends Service {
     const { notify } = record.penalize();
     Object.assign(player, record.toObject());
     this._dirty = true;
-    if (notify) this.announce(`${this._publicName(player)} has disrupted the peace!  Penalties have been applied, but life goes on.`);
+    if (notify) this.announce(`${this._chatName(player)} has disrupted the peace!  Penalties have been applied, but life goes on.`);
     return player;
   }
 
@@ -820,7 +858,7 @@ class IdleRPG extends Service {
   }
 
   async _welcomePlayer (player) {
-    this.announce(`Welcome to IdleRPG, ${this._publicName(player)}.  The one rule — _no talking in this channel_ — is now in effect.  **Violators will be slashed.**  Best of luck!`);
+    this.announce(`Welcome to IdleRPG, ${this._chatName(player)}.  The one rule — _no talking in this channel_ — is now in effect.  **Violators will be slashed.**  Best of luck!`);
   }
 
   _announcementTargets () {
@@ -1001,7 +1039,7 @@ class IdleRPG extends Service {
   }
 
   async _handleMemberlistRequest () {
-    const members = Object.values(this.content.players).filter((player) => !this._isBot(player)).map((player) => this._publicName(player));
+    const members = Object.values(this.content.players).filter((player) => !this._isBot(player)).map((player) => this._chatName(player));
     return `Current memberlist for the \`idlerpg\` plugin:\n\n\`\`\`\n${JSON.stringify(members, null, '  ')}\n\`\`\``;
   }
 
@@ -1023,7 +1061,7 @@ class IdleRPG extends Service {
     const list = Object.values(this.content.players)
       .sort((a, b) => b.experience - a.experience)
       .slice(0, 10)
-      .map((player, n) => `${n + 1}. ${this._publicName(player)}, with **${player.experience}** experience`);
+      .map((player, n) => `${n + 1}. ${this._chatName(player)}, with **${player.experience}** experience`);
     return `Leaderboard:\n${list.join('\n')}`;
   }
 
@@ -1039,17 +1077,23 @@ class IdleRPG extends Service {
     if (!actor) return `You have no wealth to transfer.`;
 
     const service = accountOf(message.actor).service;
+    const named = Object.values(this.content.players).filter((player) => player.name === targetName);
+    // Names are not unique: a name two players share names neither.
     const target = this._playerOf(targetName) ||
       (service ? this._playerOf(accountKey({ service, id: targetName })) : null) ||
-      Object.values(this.content.players).find((player) => player.name === targetName);
-    if (!target) return `Couldn't find ${targetName}.`;
+      (named.length === 1 ? named[0] : null);
+    // Never echo the target: it is user input and would post as written.
+    if (!target && named.length > 1) return `More than one player has that name.`;
+    if (!target) return `Couldn't find that player.`;
     if (target.id === actor.id) return `You cannot transfer money to yourself.`;
     if (actor.wealth - amount < 0) return `You do not have that amount.  You'll need **${amount - actor.wealth}** more <small>IDLE</small>.`;
 
     actor.wealth -= amount;
     target.wealth += amount;
     this._dirty = true;
-    if (!(await this._persist())) {
+    let saved = false;
+    try { saved = await this._persist(); } catch (_) { saved = false; }
+    if (!saved) {
       // By difference: a tick may have paid either player while the save was pending.
       actor.wealth += amount;
       target.wealth -= amount;
@@ -1060,7 +1104,7 @@ class IdleRPG extends Service {
     const account = target.accounts.find((entry) => entry.service === service) || target.accounts[0];
     if (account) this.emit('whisper', {
       target: accountKey(account),
-      object: `${this._publicName(actor)} has transferred **${amount}** <small>IDLE</small> to your account!  Check your balance with \`!balance\`.`
+      object: `${this._chatName(actor)} has transferred **${amount}** <small>IDLE</small> to your account!  Check your balance with \`!balance\`.`
     });
 
     return `Balance transferred successfully!`;

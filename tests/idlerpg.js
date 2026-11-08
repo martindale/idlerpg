@@ -191,14 +191,14 @@ describe('IdleRPG', function () {
     await rpg.stop();
   });
 
-  it('retains all daily history by default and prunes only when retentionDays is set', async function () {
+  it('keeps 400 days of history by default, every day with retentionDays 0', async function () {
     const DAY = 24 * 60 * 60 * 1000;
-    for (const [retentionDays, expected] of [[undefined, 400], [30, 30]]) {
+    for (const [retentionDays, expected] of [[undefined, 400], [30, 30], [0, 420]]) {
       const time = clock();
       const rpg = new IdleRPG({ persistent: false, autostart: false, luck: 0, now: time.now, retentionDays, verbosity: 0 });
       await rpg.start();
       await rpg._registerUser({ id: 'local/users/a', name: 'a', online: true });
-      for (let i = 0; i < 400; i++) { await rpg.tick(); time.advance(DAY); }
+      for (let i = 0; i < 420; i++) { await rpg.tick(); time.advance(DAY); }
       assert.strictEqual(Object.keys(rpg.content.stats.days).length, expected);
       await rpg.stop();
     }
@@ -344,6 +344,71 @@ describe('IdleRPG', function () {
     assert.match(String(errors[0]), /persist: .*larger than/);
     rpg.store = null;
     await rpg.stop();
+  });
+
+  it('keeps a failed save from crashing the host or moving a transfer when nobody listens for errors', async function () {
+    const rpg = new IdleRPG({ persistent: false, autostart: false, luck: 0, verbosity: 0 });
+    await rpg.start();
+    await rpg._registerUser({ id: 'local/users/a', name: 'a', online: true });
+    await rpg._registerUser({ id: 'local/users/b', name: 'b', online: true });
+    await rpg.tick();
+    const debug = [];
+    rpg.on('debug', (message) => debug.push(message));
+    rpg.store = { db: {}, set: async () => { throw new Error('disk full'); } };
+    await rpg.tick();
+    const reply = await rpg._handleTransferRequest({ actor: 'local/users/a', object: '!transfer 5 b', target: 'local/channels/x' });
+    assert.match(reply, /could not be saved/);
+    assert.strictEqual(rpg.playerFor('local/users/a').wealth + rpg.playerFor('local/users/b').wealth, rpg.playerFor('local/users/a').wealth * 2);
+    assert.ok(debug.some((message) => /persist: disk full/.test(message)));
+    rpg.store = null;
+    await rpg.stop();
+  });
+
+  it('never echoes a transfer target and refuses a name two players share', async function () {
+    const rpg = new IdleRPG({ persistent: false, autostart: false, luck: 0, verbosity: 0 });
+    await rpg.start();
+    await rpg._registerUser({ id: 'local/users/a', name: 'a', online: true });
+    await rpg._registerUser({ id: 'local/users/b', name: 'twin', online: true });
+    await rpg._registerUser({ id: 'local/users/c', name: 'twin', online: true });
+    await rpg.tick();
+    const nobody = await rpg._handleTransferRequest({ actor: 'local/users/a', object: '!transfer 1 @everyone', target: 'local/channels/x' });
+    assert.strictEqual(nobody, `Couldn't find that player.`);
+    const twin = await rpg._handleTransferRequest({ actor: 'local/users/a', object: '!transfer 1 twin', target: 'local/channels/x' });
+    assert.strictEqual(twin, 'More than one player has that name.');
+    await rpg.stop();
+  });
+
+  it('posts names that cannot ping anyone', async function () {
+    const rpg = new IdleRPG({ persistent: false, autostart: false, luck: 0, announcements: ['local/channels/news'], verbosity: 0 });
+    const posted = [];
+    rpg.on('message', (message) => posted.push(message.object));
+    await rpg.start();
+    await rpg._registerUser({ id: 'local/users/a', name: '@everyone <@&1>', online: true });
+    await rpg.tick();
+    assert.ok(posted.length > 0);
+    for (const text of posted) {
+      assert.ok(!text.includes('@everyone'), text);
+      assert.ok(!text.includes('<@&'), text);
+    }
+    assert.strictEqual(rpg.leaderboard()[0].name, '@everyone <@&1>');
+    await rpg.stop();
+  });
+
+  it('keeps no record of someone present only where the game does not count', async function () {
+    const rpg = new IdleRPG({ persistent: false, autostart: false, channels: ['idlerpg'], verbosity: 0 });
+    await rpg.start();
+    await rpg._handleJoin({ user: 'local/users/a', channel: 'local/channels/general' });
+    await rpg._handlePart({ user: 'local/users/z', channel: 'local/channels/general' });
+    assert.deepStrictEqual(Object.keys(rpg.content.users), []);
+    await rpg.stop();
+  });
+
+  it('will not start from a save that is not a game', async function () {
+    for (const prior of ['{not json', '[1,2]', JSON.stringify({ users: [] })]) {
+      const rpg = new IdleRPG({ persistent: false, autostart: false, verbosity: 0 });
+      rpg.store = { db: {}, get: async () => prior, set: async () => {} };
+      await assert.rejects(() => rpg.start(), /\[IDLERPG\] the save/);
+    }
   });
 
   it('builds a strict Store and will not start empty when the save cannot be read', async function () {
